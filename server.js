@@ -3,7 +3,8 @@ const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
 
 const app = express();
-app.get("/", (req, res) => res.send("DAILY BASES is running."));
+
+app.get("/", (req, res) => res.send("🟢 DAILY BASES is running."));
 app.get("/health", (req, res) => {
   res.json({
     bot: "DAILY BASES",
@@ -18,7 +19,7 @@ const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const API_KEY = process.env.TWELVE_DATA_API_KEY;
 
 if (!TOKEN || !API_KEY) {
-  console.error("Missing TELEGRAM_BOT_TOKEN or TWELVE_DATA_API_KEY");
+  console.error("❌ Missing TELEGRAM_BOT_TOKEN or TWELVE_DATA_API_KEY");
   process.exit(1);
 }
 
@@ -33,6 +34,7 @@ let dailySignals = [];
 let wins = 0;
 let losses = 0;
 let paused = false;
+let scanBusy = false;
 
 const CFG = {
   symbol: "XAU/USD",
@@ -48,8 +50,23 @@ const CFG = {
   minBodyATR: 0.20
 };
 
+const KEYBOARD = {
+  reply_markup: {
+    keyboard: [
+      [{ text: "📊 Market Status" }, { text: "📈 My Statistics" }],
+      [{ text: "🏆 Mark WIN" }, { text: "❌ Mark LOSS" }],
+      [{ text: "⏸️ Pause Alerts" }, { text: "▶️ Resume Alerts" }],
+      [{ text: "ℹ️ Help" }]
+    ],
+    resize_keyboard: true,
+    is_persistent: true
+  }
+};
+
 function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+  // Nigeria local calendar date (UTC+1).
+  return new Date(Date.now() + 60 * 60 * 1000)
+    .toISOString().slice(0, 10);
 }
 
 function resetDailyStats() {
@@ -59,6 +76,14 @@ function resetDailyStats() {
     dailySignals = [];
     wins = 0;
     losses = 0;
+  }
+}
+
+async function reply(chatId, message) {
+  try {
+    return await bot.sendMessage(chatId, message, KEYBOARD);
+  } catch (error) {
+    console.error("❌ Telegram send error:", error.message);
   }
 }
 
@@ -145,7 +170,9 @@ async function getCandles() {
   url.searchParams.set("apikey", API_KEY);
 
   const response = await fetch(url);
-  if (!response.ok) throw new Error(`Market API HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`Market API HTTP ${response.status}`);
+  }
 
   const data = await response.json();
 
@@ -204,10 +231,7 @@ function findSetup(candles5) {
   const trend15 = trend(candles15);
   const trend60 = trend(candles60);
 
-  if (trend15 === "NEUTRAL" || trend60 === "NEUTRAL") {
-    return null;
-  }
-
+  if (trend15 === "NEUTRAL" || trend60 === "NEUTRAL") return null;
   if (trend15 !== trend60) return null;
 
   const closes = candles5.map(c => c.close);
@@ -219,7 +243,8 @@ function findSetup(candles5) {
   const last = candles5[candles5.length - 1];
   const prev = candles5[candles5.length - 2];
 
-  if (!volatility || !strength || volatility <= 0) return null;
+  if (!volatility || strength === null || volatility <= 0) return null;
+
   if (Math.abs(last.close - last.open) < volatility * CFG.minBodyATR) {
     return null;
   }
@@ -267,25 +292,25 @@ function findSetup(candles5) {
   let tp;
 
   if (side === "BUY") {
-    sl = Math.min(entry - volatility * CFG.stopATR, recentLow - volatility * 0.1);
-    const risk = entry - sl;
-    tp = entry + risk * CFG.rewardRisk;
+    sl = Math.min(
+      entry - volatility * CFG.stopATR,
+      recentLow - volatility * 0.1
+    );
+    tp = entry + (entry - sl) * CFG.rewardRisk;
   } else {
-    sl = Math.max(entry + volatility * CFG.stopATR, recentHigh + volatility * 0.1);
-    const risk = sl - entry;
-    tp = entry - risk * CFG.rewardRisk;
+    sl = Math.max(
+      entry + volatility * CFG.stopATR,
+      recentHigh + volatility * 0.1
+    );
+    tp = entry - (sl - entry) * CFG.rewardRisk;
   }
 
   return {
-    side,
-    entry,
-    sl,
-    tp,
+    side, entry, sl, tp,
     rsi: strength,
     atr: volatility,
     candleTime: last.time,
-    trend15,
-    trend60
+    trend15, trend60
   };
 }
 
@@ -295,27 +320,31 @@ function price(n) {
 
 async function sendSignal(setup) {
   if (!activeChatId) {
-    console.log("Waiting for a user to send /start in Telegram.");
+    console.log("📩 Waiting for /start in Telegram.");
     return;
   }
 
   resetDailyStats();
 
   const message =
-    `🟡 DAILY BASES — XAUUSD\n\n` +
-    `📣 SIGNAL: ${setup.side}\n` +
+    `🟡🔥 DAILY BASES — XAUUSD 🔥🟡\n\n` +
+    `${setup.side === "BUY" ? "🟢🚀 BUY SIGNAL 🚀🟢" : "🔴📉 SELL SIGNAL 📉🔴"}\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
     `💰 Entry: ${price(setup.entry)}\n` +
     `🛑 Stop Loss: ${price(setup.sl)}\n` +
-    `🎯 Take Profit: ${price(setup.tp)}\n\n` +
+    `🎯 Take Profit: ${price(setup.tp)}\n` +
+    `━━━━━━━━━━━━━━━━━━\n` +
+    `⏰ Entry timeframe: M5\n` +
     `📊 1H trend: ${setup.trend60}\n` +
-    `📊 15M trend: ${setup.trend15}\n` +
-    `⚡ Entry: 5M pullback confirmation\n` +
-    `RSI: ${setup.rsi.toFixed(1)}\n` +
-    `Risk/reward: 1:${CFG.rewardRisk}\n\n` +
+    `📈 15M trend: ${setup.trend15}\n` +
+    `💪 RSI: ${setup.rsi.toFixed(1)}\n` +
+    `⚖️ Risk/Reward: 1:${CFG.rewardRisk}\n\n` +
     `📅 Today's signals: ${dailySignals.length + 1}\n` +
-    `⚠️ Confirm the live price with your broker before entering.`;
+    `🎯 Daily target: ${CFG.dailyTarget}\n\n` +
+    `⚠️ Verify the live price with your broker before entering.\n` +
+    `🛡️ Risk management is essential. No profit is guaranteed.`;
 
-  await bot.sendMessage(activeChatId, message);
+  await reply(activeChatId, message);
 
   dailySignals.push({
     ...setup,
@@ -325,129 +354,211 @@ async function sendSignal(setup) {
 
   lastSignalTime = Date.now();
   lastSignalCandle = String(setup.candleTime);
-  console.log(`Sent ${setup.side} signal at ${price(setup.entry)}`);
+
+  console.log(`📨 Sent ${setup.side} signal at ${price(setup.entry)}`);
 }
 
 async function scan() {
   resetDailyStats();
 
-  if (paused) return;
+  if (paused || scanBusy) return;
 
   const now = new Date();
 
-  // Only request data once per 5-minute period, after the candle closes.
   if (now.getUTCMinutes() % 5 !== 0 || now.getUTCSeconds() < 20) {
     return;
   }
 
-  const bucket = `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}-${now.getUTCHours()}-${Math.floor(now.getUTCMinutes() / 5)}`;
+  const bucket =
+    `${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}-` +
+    `${now.getUTCHours()}-${Math.floor(now.getUTCMinutes() / 5)}`;
 
   if (bucket === lastProcessedBucket) return;
   lastProcessedBucket = bucket;
+  scanBusy = true;
 
   try {
     const candles = await getCandles();
     const setup = findSetup(candles);
 
     if (!setup) {
-      console.log("No valid setup on this scan.");
+      console.log("🔎 No valid setup found on this scan.");
       return;
     }
 
-    if (String(setup.candleTime) === lastSignalCandle) return;
+    if (String(setup.candleTime) === lastSignalCandle) {
+      console.log("🔁 Duplicate signal skipped.");
+      return;
+    }
 
     if (Date.now() - lastSignalTime < CFG.cooldownMinutes * 60 * 1000) {
-      console.log("Setup skipped: cooldown is active.");
+      console.log("⏳ Setup skipped: cooldown is active.");
       return;
     }
 
     await sendSignal(setup);
   } catch (error) {
-    console.error("Scan error:", error.message);
+    console.error("⚠️ Market scan error:", error.message);
+  } finally {
+    scanBusy = false;
+  }
+}
+
+function statsMessage() {
+  resetDailyStats();
+
+  const pending = dailySignals.filter(s => s.outcome === "PENDING").length;
+  const completed = wins + losses;
+  const rate = completed ? (wins / completed * 100).toFixed(1) : "0.0";
+
+  return (
+    `📊🔥 DAILY BASES RESULTS 🔥📊\n\n` +
+    `📨 Signals sent: ${dailySignals.length}\n` +
+    `🎯 Daily target: ${CFG.dailyTarget}\n` +
+    `🏆 Wins marked: ${wins}\n` +
+    `❌ Losses marked: ${losses}\n` +
+    `⏳ Pending: ${pending}\n` +
+    `📈 Recorded win rate: ${rate}%\n\n` +
+    `ℹ️ Results are based on signals marked manually.`
+  );
+}
+
+async function markOutcome(chatId, outcome) {
+  resetDailyStats();
+
+  const signal = [...dailySignals].reverse().find(
+    s => s.outcome === "PENDING"
+  );
+
+  if (!signal) {
+    await reply(chatId, "⚠️ No pending signal is available to update.");
+    return;
+  }
+
+  signal.outcome = outcome;
+
+  if (outcome === "WIN") wins++;
+  else losses++;
+
+  await reply(
+    chatId,
+    outcome === "WIN"
+      ? "🏆✅ Latest pending signal marked as WIN!"
+      : "❌📉 Latest pending signal marked as LOSS."
+  );
+}
+
+async function handleAction(msg, action) {
+  const chatId = msg.chat.id;
+
+  switch (action) {
+    case "📊 Market Status":
+    case "/status":
+      resetDailyStats();
+      await reply(
+        chatId,
+        `🟡📊 DAILY BASES STATUS 📊🟡\n\n` +
+        `🪙 Market: XAUUSD\n` +
+        `⏱️ Timeframes: 1H + 15M + 5M\n` +
+        `🔔 Alerts: ${paused ? "⏸️ PAUSED" : "🟢 ACTIVE"}\n` +
+        `🎯 Daily target: ${CFG.dailyTarget} setups\n` +
+        `📨 Signals sent today: ${dailySignals.length}\n` +
+        `🌙 Overnight scanning: Enabled while service and market data are available.`
+      );
+      break;
+
+    case "📈 My Statistics":
+    case "/stats":
+      await reply(chatId, statsMessage());
+      break;
+
+    case "🏆 Mark WIN":
+    case "/win":
+      await markOutcome(chatId, "WIN");
+      break;
+
+    case "❌ Mark LOSS":
+    case "/loss":
+      await markOutcome(chatId, "LOSS");
+      break;
+
+    case "⏸️ Pause Alerts":
+    case "/pause":
+      paused = true;
+      await reply(chatId, "⏸️🔕 DAILY BASES alerts are now paused.");
+      break;
+
+    case "▶️ Resume Alerts":
+    case "/resume":
+      paused = false;
+      await reply(chatId, "▶️🔔 DAILY BASES alerts have resumed.");
+      break;
+
+    case "ℹ️ Help":
+    case "/help":
+      await reply(
+        chatId,
+        `ℹ️🤖 DAILY BASES HELP 🤖ℹ️\n\n` +
+        `📊 Market Status — Check the bot\n` +
+        `📈 My Statistics — View today's results\n` +
+        `🏆 Mark WIN — Record a winning signal\n` +
+        `❌ Mark LOSS — Record a losing signal\n` +
+        `⏸️ Pause Alerts — Stop new alerts\n` +
+        `▶️ Resume Alerts — Restart alerts\n\n` +
+        `⚠️ Signals are alerts, not guaranteed profits.`
+      );
+      break;
   }
 }
 
 bot.onText(/\/start/, async msg => {
   activeChatId = String(msg.chat.id);
 
-  await bot.sendMessage(
+  await reply(
     activeChatId,
-    "🟡 Welcome to DAILY BASES!\n\n" +
-    "Automatic XAUUSD signal monitoring is enabled.\n" +
-    "Target: 3 valid setups daily, when available.\n\n" +
-    "/status — Bot status\n" +
-    "/stats — Daily results\n" +
-    "/win — Mark latest pending signal WIN\n" +
-    "/loss — Mark latest pending signal LOSS\n" +
-    "/pause — Pause alerts\n" +
-    "/resume — Resume alerts\n\n" +
-    "Keep in mind: signals are not guaranteed to win."
+    `👋🔥 WELCOME TO DAILY BASES! 🔥👋\n\n` +
+    `🪙 Market: XAUUSD Gold\n` +
+    `⚡ Strategy: Fast but filtered entries\n` +
+    `📊 Analysis: 1H + 15M + 5M\n` +
+    `🎯 Daily target: 3 valid setups when available\n` +
+    `🌙 Overnight monitoring: Enabled\n\n` +
+    `👇 Use the emoji buttons below to control your bot.\n\n` +
+    `⚠️ Setups and profits are not guaranteed.`
   );
 });
 
-bot.onText(/\/status/, msg => {
-  bot.sendMessage(
-    msg.chat.id,
-    `🟡 DAILY BASES STATUS\n\n` +
-    `Market: XAUUSD\n` +
-    `Strategy: 1H + 15M + 5M\n` +
-    `Alerts: ${paused ? "PAUSED" : "ACTIVE"}\n` +
-    `Today's target: ${CFG.dailyTarget} setups\n` +
-    `Signals sent today: ${dailySignals.length}`
-  );
-});
+bot.on("message", async msg => {
+  if (!msg.text) return;
 
-bot.onText(/\/stats/, msg => {
-  resetDailyStats();
+  const action = msg.text.trim();
 
-  bot.sendMessage(
-    msg.chat.id,
-    `📊 DAILY BASES RESULTS\n\n` +
-    `Signals sent: ${dailySignals.length}\n` +
-    `Wins marked: ${wins}\n` +
-    `Losses marked: ${losses}\n` +
-    `Pending: ${dailySignals.filter(s => s.outcome === "PENDING").length}\n` +
-    `Win rate: ${wins + losses ? (wins / (wins + losses) * 100).toFixed(1) : 0}%\n\n` +
-    `WIN/LOSS results are recorded when you mark them.`
-  );
-});
+  if (action === "/start") return;
 
-async function markOutcome(msg, outcome) {
-  resetDailyStats();
+  const actions = [
+    "📊 Market Status", "📈 My Statistics",
+    "🏆 Mark WIN", "❌ Mark LOSS",
+    "⏸️ Pause Alerts", "▶️ Resume Alerts",
+    "ℹ️ Help", "/status", "/stats",
+    "/win", "/loss", "/pause", "/resume", "/help"
+  ];
 
-  const signal = [...dailySignals].reverse().find(s => s.outcome === "PENDING");
-
-  if (!signal) {
-    return bot.sendMessage(msg.chat.id, "No pending signal to update.");
+  if (actions.includes(action)) {
+    try {
+      await handleAction(msg, action);
+    } catch (error) {
+      console.error("❌ Button action error:", error.message);
+      await reply(msg.chat.id, "⚠️ Something went wrong. Please try again.");
+    }
   }
-
-  signal.outcome = outcome;
-  if (outcome === "WIN") wins++;
-  else losses++;
-
-  await bot.sendMessage(msg.chat.id, `Latest pending signal marked ${outcome}.`);
-}
-
-bot.onText(/\/win/, msg => markOutcome(msg, "WIN"));
-bot.onText(/\/loss/, msg => markOutcome(msg, "LOSS"));
-
-bot.onText(/\/pause/, async msg => {
-  paused = true;
-  await bot.sendMessage(msg.chat.id, "⏸ DAILY BASES alerts paused.");
-});
-
-bot.onText(/\/resume/, async msg => {
-  paused = false;
-  await bot.sendMessage(msg.chat.id, "▶️ DAILY BASES alerts resumed.");
 });
 
 bot.on("polling_error", error => {
-  console.error("Telegram polling error:", error.message);
+  console.error("⚠️ Telegram polling error:", error.message);
 });
 
 app.listen(PORT, () => {
-  console.log(`DAILY BASES web server listening on ${PORT}`);
+  console.log(`🟢 DAILY BASES web server listening on port ${PORT}`);
 });
 
 setInterval(scan, CFG.scanSeconds * 1000);
-console.log("DAILY BASES started.");
+console.log("🚀 DAILY BASES started.");
