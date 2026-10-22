@@ -7,6 +7,7 @@
  *
  * Data: Twelve Data /time_series
  * Hosting: Render Web Service
+ * Telegram UI update: persistent emoji menu + inline action buttons on automatic signal alerts.
  */
 
 require("dotenv").config();
@@ -320,10 +321,45 @@ function signalMessage(s) {
   ].join("\n");
 }
 
-async function sendTelegram(message, chatId = TELEGRAM_CHAT_ID) {
+const MENU_BUTTONS = {
+  getSignal: "🎯 Get Signal",
+  status: "📊 Market Status",
+  history: "📜 Signal History",
+  results: "🏆 Trade Results",
+  help: "⚙️ Help & Settings"
+};
+
+function replyKeyboard() {
+  return {
+    keyboard: [
+      [{ text: MENU_BUTTONS.getSignal }, { text: MENU_BUTTONS.status }],
+      [{ text: MENU_BUTTONS.history }, { text: MENU_BUTTONS.results }],
+      [{ text: MENU_BUTTONS.help }]
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+    input_field_placeholder: "Choose a BOT.XAU action 👇"
+  };
+}
+
+function inlineMenu() {
+  return {
+    inline_keyboard: [
+      [{ text: MENU_BUTTONS.getSignal, callback_data: "menu:getSignal" }, { text: MENU_BUTTONS.status, callback_data: "menu:status" }],
+      [{ text: MENU_BUTTONS.history, callback_data: "menu:history" }, { text: MENU_BUTTONS.results, callback_data: "menu:results" }],
+      [{ text: MENU_BUTTONS.help, callback_data: "menu:help" }]
+    ]
+  };
+}
+
+async function sendTelegram(message, chatId = TELEGRAM_CHAT_ID, extra = {}) {
   if (!bot) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
   if (!chatId) throw new Error("TELEGRAM_CHAT_ID is missing. Set it in Render Environment.");
-  return bot.sendMessage(chatId, message, { parse_mode: "Markdown", disable_web_page_preview: true });
+  return bot.sendMessage(chatId, message, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    ...extra
+  });
 }
 async function broadcastSignal(signal) {
   if (!TELEGRAM_CHAT_ID) {
@@ -331,7 +367,7 @@ async function broadcastSignal(signal) {
     return false;
   }
   try {
-    await sendTelegram(signalMessage(signal));
+    await sendTelegram(signalMessage(signal), TELEGRAM_CHAT_ID, { reply_markup: inlineMenu() });
     return true;
   } catch (err) {
     console.error("Telegram signal send failed:", err.message);
@@ -470,31 +506,107 @@ app.get("/signals", (_req, res) => {
   });
 });
 
+async function sendStatus(chatId) {
+  const message = `🤖 *BOT.XAU STATUS*\n\n🟡 Symbol: ${SYMBOL}\n📡 Scan: ${state.lastScanStatus}\n⏰ Last scan: ${state.lastScanAt || "not yet"}\n💵 Last price: ${state.lastPrice == null ? "not available" : fmt(state.lastPrice)}\n📂 Open signals: ${state.signals.filter(s => s.status === "OPEN").length}\n⚠️ Error: ${state.lastError || "none"}`;
+  return sendTelegram(message, chatId, { reply_markup: replyKeyboard() });
+}
+
+async function sendHistory(chatId) {
+  const recent = state.signals.slice(0, 5);
+  const message = recent.length
+    ? "📜 *LATEST BOT.XAU SIGNALS*\n\n" + recent.map(s => `${s.direction === "BUY" ? "🟢" : "🔴"} *${s.direction}* | ${s.status}\n💵 Entry ${fmt(s.entry)} · 🛑 SL ${fmt(s.stopLoss)} · 🎯 TP1 ${fmt(s.takeProfit1)}\n🧾 Result: ${s.result || (s.hitTP1 ? "TP1 hit; still active" : "in progress")}`).join("\n\n")
+    : "🔎 No signals recorded yet. The scanner sends an alert only when its conditions match.";
+  return sendTelegram(message, chatId, { reply_markup: replyKeyboard() });
+}
+
+async function sendTradeResults(chatId) {
+  const closed = state.signals.filter(s => s.status === "CLOSED");
+  const wins = closed.filter(s => s.result === "TP2").length;
+  const losses = closed.filter(s => s.result === "STOP_LOSS").length;
+  const tp1ThenSl = closed.filter(s => s.result === "TP1_THEN_SL").length;
+  const open = state.signals.filter(s => s.status === "OPEN").length;
+  const message = `🏆 *BOT.XAU — TRADE RESULTS*\n\n📊 Closed signals: ${closed.length}\n🟢 TP2 wins: ${wins}\n🔴 Stop-loss outcomes: ${losses}\n🟡 TP1 then SL: ${tp1ThenSl}\n⏳ Active signals: ${open}\n\nℹ️ Counts are based on candle tracking, not broker account results.`;
+  return sendTelegram(message, chatId, { reply_markup: replyKeyboard() });
+}
+
+async function handleMenuAction(action, chatId) {
+  if (action === "status") return sendStatus(chatId);
+  if (action === "history") return sendHistory(chatId);
+  if (action === "results") return sendTradeResults(chatId);
+  if (action === "help") {
+    return sendTelegram([
+      "⚙️ *BOT.XAU — HELP & SETTINGS*",
+      "",
+      "🎯 *Get Signal* — runs a market scan and shows the latest signal if available.",
+      "📊 *Market Status* — shows scanner status and latest price.",
+      "📜 *Signal History* — shows the five most recent signals.",
+      "🏆 *Trade Results* — summarizes tracked outcomes.",
+      "🤖 Automatic alerts are still enabled when a valid setup is confirmed.",
+      "",
+      "⚠️ Signal alerts only. This bot does not place broker orders."
+    ].join("\n"), chatId, { reply_markup: replyKeyboard() });
+  }
+  if (action === "getSignal") {
+    const before = new Set(state.signals.map(s => s.id));
+    await sendTelegram("🔎 Scanning XAU/USD now…\n⏳ Checking 1D + 4H zones and 15M confirmation.", chatId, { reply_markup: replyKeyboard() });
+    await guardedScan();
+    const latest = state.signals.find(s => !before.has(s.id)) || state.signals[0];
+    if (latest) {
+      return sendTelegram(signalMessage(latest), chatId, { reply_markup: inlineMenu() });
+    }
+    return sendTelegram(
+      `🧭 *No new confirmed setup right now*\n\n📡 Scanner: ${state.lastScanStatus}\n💵 Latest price: ${state.lastPrice == null ? "not available" : fmt(state.lastPrice)}\n⏰ Last scan: ${state.lastScanAt || "not yet"}\n\n🛡️ The bot will keep scanning automatically and alert you when the rules match.`,
+      chatId,
+      { reply_markup: replyKeyboard() }
+    );
+  }
+}
+
 if (bot) {
   bot.onText(/\/start|\/help/, async msg => {
     const text = [
-      "🎯 *BOT.XAU Sniper Entry*",
+      "🎯 *Welcome to BOT.XAU — SNIPER ENTRY*",
       "",
-      "🤖 Automatic XAU/USD alerts using 1D + 4H supply/demand zones and 15M confirmation.",
+      "🥇 XAU/USD only | 🤖 Automatic signal alerts",
+      "🧠 Strategy: 1D + 4H supply/demand zones, with 15M liquidity sweep and BOS/CHOCH-style confirmation.",
       "",
-      "📊 /status — scanner status",
-      "📈 /signals — latest signal results",
-      "ℹ️ /help — help",
-      "",
-      "⚠️ Alerts are not broker orders. Verify every setup before trading."
+      "👇 Use the buttons below to control the bot.",
+      "⚠️ Signals are alerts only; no broker orders are placed."
     ].join("\n");
-    try { await sendTelegram(text, String(msg.chat.id)); } catch (e) { console.error(e.message); }
+    try {
+      await sendTelegram(text, String(msg.chat.id), { reply_markup: replyKeyboard() });
+      await sendTelegram("🚀 *Quick actions*", String(msg.chat.id), { reply_markup: inlineMenu() });
+    } catch (e) { console.error(e.message); }
   });
+
   bot.onText(/\/status/, async msg => {
-    const text = `🤖 *BOT.XAU STATUS*\n\n🟡 Symbol: ${SYMBOL}\n📡 Scan: ${state.lastScanStatus}\n⏰ Last scan: ${state.lastScanAt || "not yet"}\n💵 Last price: ${state.lastPrice == null ? "not available" : fmt(state.lastPrice)}\n📂 Open signals: ${state.signals.filter(s => s.status === "OPEN").length}\n⚠️ Error: ${state.lastError || "none"}`;
-    try { await sendTelegram(text, String(msg.chat.id)); } catch (e) { console.error(e.message); }
+    try { await sendStatus(String(msg.chat.id)); } catch (e) { console.error(e.message); }
   });
   bot.onText(/\/signals/, async msg => {
-    const recent = state.signals.slice(0, 5);
-    const text = recent.length
-      ? "📈 *LATEST BOT.XAU SIGNALS*\n\n" + recent.map(s => `${s.direction === "BUY" ? "🟢" : "🔴"} ${s.direction} | ${s.status}\nEntry ${fmt(s.entry)} · SL ${fmt(s.stopLoss)} · TP1 ${fmt(s.takeProfit1)}\nResult: ${s.result || "in progress"}`).join("\n\n")
-      : "🔎 No signals recorded yet. The bot sends a signal only when all conditions match.";
-    try { await sendTelegram(text, String(msg.chat.id)); } catch (e) { console.error(e.message); }
+    try { await sendHistory(String(msg.chat.id)); } catch (e) { console.error(e.message); }
+  });
+
+  bot.on("callback_query", async query => {
+    const match = /^menu:(getSignal|status|history|results|help)$/.exec(query.data || "");
+    if (!match || !query.message) return;
+    try {
+      await bot.answerCallbackQuery(query.id);
+      await handleMenuAction(match[1], String(query.message.chat.id));
+    } catch (e) {
+      console.error("Telegram button error:", e.message);
+      try { await bot.answerCallbackQuery(query.id, { text: "⚠️ Could not complete that action. Try again." }); } catch (_) {}
+    }
+  });
+
+  bot.on("message", async msg => {
+    if (!msg.text || msg.text.startsWith("/")) return;
+    const action = Object.keys(MENU_BUTTONS).find(key => MENU_BUTTONS[key] === msg.text.trim());
+    if (!action) return;
+    try { await handleMenuAction(action, String(msg.chat.id)); }
+    catch (e) {
+      console.error("Telegram menu action failed:", e.message);
+      try { await sendTelegram("⚠️ Something went wrong with that button. Please try again shortly.", String(msg.chat.id), { reply_markup: replyKeyboard() }); } catch (_) {}
+    }
   });
 }
 
