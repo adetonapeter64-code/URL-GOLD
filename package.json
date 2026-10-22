@@ -1,0 +1,17 @@
+{
+  "name": "bot-xau-sniper-entry",
+  "version": "1.0.0",
+  "description": "Independent XAU/USD supply and demand sniper signal bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}
